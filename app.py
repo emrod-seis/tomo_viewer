@@ -1,11 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Seismic Tomography Viewer — SAM5 + Slab2 + GVP Volcanoes
-----------------------------------------------------------
-Layer 1: .tomo CSV  → 3-D P-wave velocity perturbation isosurfaces
-Layer 2: .grd HDF5  → Slab2 slab geometry surface (depth in km)
-Layer 3: GVP .xls   → Holocene volcanoes clipped to plotted region
+TOMOVIEWER - plot 3d datasets
 
 Run:
     pip install dash plotly numpy pandas scipy h5py lxml xlrd
@@ -1187,7 +1183,7 @@ input[type=number] { -moz-appearance: textfield; appearance: textfield; }
             html.H1('TOMO VIEWER',
                     style=dict(fontSize='17px', letterSpacing='4px',
                                color='#4af', margin='0 0 4px 0', fontWeight='400')),
-            html.P('3D views of Seismic Tomography | Earthquakes | Slab Models | Volcanoes',
+            html.P('3D data viewer',
                    style=dict(color='#7a90a8', fontSize='11px',
                               margin=0, letterSpacing='1.5px')),
         ]),
@@ -1208,18 +1204,6 @@ input[type=number] { -moz-appearance: textfield; appearance: textfield; }
                 # ── Tomo upload ───────────────────────────────────────────────
                 html.Div(style=PANEL, children=[
                     html.Span('TOMO FILE  (.tomo / .csv)', style=LBL),
-                    dcc.RadioItems(
-                        id='wave-type',
-                        className='radio-group',
-                        inputClassName='radio-input',
-                        labelClassName='radio-label',
-                        options=[{'label': 'Vp', 'value': 'vp'},
-                                 {'label': 'Vs', 'value': 'vs'}],
-                        value='vp', inline=True,  
-                        labelStyle={
-                            'color': '#6ab4ff'
-                        }
-                    ),
                     dcc.Upload(id='upload-tomo',
                                children=html.Div([
                                    html.Span('Drop .tomo / CSV ',
@@ -1620,14 +1604,13 @@ input[type=number] { -moz-appearance: textfield; appearance: textfield; }
     Output('depth-range', 'marks'),
     Input('upload-tomo',  'contents'),
     State('upload-tomo',  'filename'),
-    State('wave-type',    'value'),
     prevent_initial_call=True,
 )
-def load_tomo(contents, filename, wave_type):
+def load_tomo(contents, filename):
     if not contents:
         raise dash.exceptions.PreventUpdate
     _, b64 = contents.split(',', 1)
-    df, vel_label, err = parse_tomo(base64.b64decode(b64), wave_type=wave_type or 'vp')
+    df, vel_label, err = parse_tomo(base64.b64decode(b64), wave_type='vp')
     if err:
         return ([dash.no_update] * 2 + [_status_div(f'Error: {err}', ok=False)] +
                 [dash.no_update] * 7)
@@ -1743,7 +1726,6 @@ def load_xyz(contents, filename):
     Output('iso-range-header',  'children'),
     Input('tomo-store',    'data'),
     Input('vel-label',     'data'),
-    Input('wave-type',     'value'),
     Input('slab-store',    'data'),
     Input('vol-store',     'data'),
     Input('hq-slider',     'value'),
@@ -1770,14 +1752,14 @@ def load_xyz(contents, filename):
     Input('xyz-colorscale', 'value'),
     Input('xyz-ngrid',    'value'),
 )
-def update_figure(tomo_store, vel_label, wave_type, slab_store, vol_store, hq_min, iso_min, iso_max,
+def update_figure(tomo_store, vel_label, slab_store, vol_store, hq_min, iso_min, iso_max,
                   n_surf, opacity, cs_name, depth_range, ngrid,
                   slab_op, slab_mode, eq_store, eq_min_mag,
                   show_vol_val, show_eq_val, eq_scale_val, show_slab_val, show_borders_val,
                   show_tomo_val,
                   xyz_store, show_xyz_val, xyz_opacity, xyz_colorscale, xyz_ngrid):
     df = pd.DataFrame(tomo_store)
-    vel_label = vel_label or ('%dVs' if wave_type == 'vs' else '%dVp')
+    vel_label = vel_label or '%dVp'
     slab = _decode_slab(slab_store)
     vol_df = pd.DataFrame(vol_store) if vol_store else None
     show_slab = bool(show_slab_val)
