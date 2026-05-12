@@ -1,5 +1,5 @@
-Requires:
-    pip install dash plotly numpy pandas scipy h5py lxml xlrd
+Requires python packages:
+    dash plotly numpy pandas scipy h5py lxml xlrd
 
 Run:
 
