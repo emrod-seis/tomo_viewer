@@ -25,6 +25,18 @@ import lxml.etree as _lxml_ET
 app = dash.Dash(__name__)
 server = app.server
 
+# ── Shutdown endpoint ─────────────────────────────────────────────────────────
+import signal, threading
+
+@server.route('/shutdown', methods=['POST'])
+def shutdown():
+    """Called by the browser's beforeunload event to kill the server."""
+    def _kill():
+        import time; time.sleep(0.3)
+        os.kill(os.getpid(), signal.SIGTERM)
+    threading.Thread(target=_kill, daemon=True).start()
+    return 'bye', 200
+
 # ── Colorscales ───────────────────────────────────────────────────────────────
 SEISMIC_SCALE = [
     [0.00, 'rgb(0,0,160)'],
@@ -231,7 +243,12 @@ def _load_borders():
 
     return xs, ys
 
-_BORDER_XS, _BORDER_YS = _load_borders()
+def _check_borders_available():
+    _ensure_shapefile()
+    return os.path.exists(_BORDERS_SHP) and os.path.getsize(_BORDERS_SHP) > 1000
+
+_BORDER_XS = True if _check_borders_available() else None
+_BORDER_YS = _BORDER_XS
 
 from shapely.geometry import box
 import geopandas as gpd
@@ -241,8 +258,13 @@ import plotly.graph_objects as go
 def borders_trace(lat_min, lat_max, lon_min, lon_max):
     import os
     if not os.path.exists(_BORDERS_SHP) or os.path.getsize(_BORDERS_SHP) < 1000:
+        print('[borders] shapefile missing')
         return None
-    world = gpd.read_file(_BORDERS_SHP)
+    try:
+        world = gpd.read_file(_BORDERS_SHP)
+    except Exception as e:
+        print(f'[borders] read failed: {e}')
+        return None
 
     bbox = box(lon_min, lat_min, lon_max, lat_max)
 
@@ -643,7 +665,7 @@ def _blockmean(lon, lat, val, lon_min, lon_max, lat_min, lat_max, ncells):
     return lon_c, lat_c, sums[mask] / counts[mask]
 
 
-def interpolate_to_grid(df, hq_min, depth_range, ngrid=50):
+def interpolate_to_grid(df, hq_min, depth_range, ngrid=50, lat_range=None, lon_range=None):
     """
     For each depth layer:
       1. blockmean  — average scattered points into cells  (gmt blockmean)
@@ -656,11 +678,16 @@ def interpolate_to_grid(df, hq_min, depth_range, ngrid=50):
     from scipy.interpolate import RBFInterpolator
     from scipy.spatial import cKDTree
 
-    sub = df[
+    mask = (
         (df['hq'] >= hq_min) &
         (df['dep'] >= depth_range[0]) &
         (df['dep'] <= depth_range[1])
-    ]
+    )
+    if lat_range is not None:
+        mask &= (df['lat'] >= lat_range[0]) & (df['lat'] <= lat_range[1])
+    if lon_range is not None:
+        mask &= (df['lon'] >= lon_range[0]) & (df['lon'] <= lon_range[1])
+    sub = df[mask]
     if len(sub) < 10:
         return None
 
@@ -726,6 +753,7 @@ def interpolate_to_grid(df, hq_min, depth_range, ngrid=50):
 # ── Figure builder ────────────────────────────────────────────────────────────
 def build_figure(df, hq_min, iso_min, iso_max, n_surfaces, opacity,
                  cs_name, depth_range, ngrid,
+                 lat_range=None, lon_range=None,
                  slab_data=None, show_slab=True, slab_opacity=0.6, slab_mode='surface',
                  vol_df=None, show_volcanoes=True, vel_label='%dVp',
                  show_borders=True, eq_df=None, show_earthquakes=False,
@@ -737,7 +765,8 @@ def build_figure(df, hq_min, iso_min, iso_max, n_surfaces, opacity,
     traces = []
 
     # ── Tomo isosurface ───────────────────────────────────────────────────────
-    result = interpolate_to_grid(df, hq_min, depth_range, ngrid) if show_tomo else None
+    result = interpolate_to_grid(df, hq_min, depth_range, ngrid,
+                                 lat_range=lat_range, lon_range=lon_range) if show_tomo else None
     if result is not None:
         x, y, z, v = result
         cs = COLORSCALE_OPTIONS.get(cs_name, SEISMIC_SCALE)
@@ -774,44 +803,51 @@ def build_figure(df, hq_min, iso_min, iso_max, n_surfaces, opacity,
     # ── Slab surface / contours ───────────────────────────────────────────────
     if show_slab and slab_data is not None:
         lon_2d, lat_2d, depth_2d = slab_data
+        if lat_range is not None or lon_range is not None:
+            la0, la1 = (lat_range if lat_range else [lat_2d.min(), lat_2d.max()])
+            lo0, lo1 = (lon_range if lon_range else [lon_2d.min(), lon_2d.max()])
+            mask = (lat_2d >= la0) & (lat_2d <= la1) & (lon_2d >= lo0) & (lon_2d <= lo1)
+            depth_clipped = np.where(mask, depth_2d, np.nan)
+            # Trim rows/cols that are entirely NaN so the surface doesn't expand the scene
+            row_ok = np.any(~np.isnan(depth_clipped), axis=1)
+            col_ok = np.any(~np.isnan(depth_clipped), axis=0)
+            lon_2d    = lon_2d[np.ix_(row_ok, col_ok)]
+            lat_2d    = lat_2d[np.ix_(row_ok, col_ok)]
+            depth_clipped = depth_clipped[np.ix_(row_ok, col_ok)]
+        else:
+            depth_clipped = depth_2d
         if slab_mode == 'contours':
-            tr = slab_contour_trace(lon_2d, lat_2d, depth_2d)
+            tr = slab_contour_trace(lon_2d, lat_2d, depth_clipped)
             if tr is not None:
                 traces.append(tr)
         else:
-            traces.append(slab_trace(lon_2d, lat_2d, depth_2d, opacity=slab_opacity))
+            traces.append(slab_trace(lon_2d, lat_2d, depth_clipped, opacity=slab_opacity))
+
+    # Shared region bounds for volcanoes / borders
+    _lat_min = lat_range[0] if lat_range else df['lat'].min()
+    _lat_max = lat_range[1] if lat_range else df['lat'].max()
+    _lon_min = lon_range[0] if lon_range else df['lon'].min()
+    _lon_max = lon_range[1] if lon_range else df['lon'].max()
 
     # ── Volcanoes ─────────────────────────────────────────────────────────────
     if show_volcanoes and vol_df is not None and len(vol_df) > 0:
-        sub_tomo = df[
-            (df['hq'] >= hq_min) &
-            (df['dep'] >= depth_range[0]) &
-            (df['dep'] <= depth_range[1])
-        ]
-        if len(sub_tomo):
-            clipped = filter_volcanoes_to_region(
-                vol_df,
-                lat_min=sub_tomo['lat'].min(), lat_max=sub_tomo['lat'].max(),
-                lon_min=sub_tomo['lon'].min(), lon_max=sub_tomo['lon'].max(),
-            )
-            tr = volcano_trace(clipped)
-            if tr is not None:
-                traces.append(tr)
+        clipped = filter_volcanoes_to_region(
+            vol_df,
+            lat_min=_lat_min, lat_max=_lat_max,
+            lon_min=_lon_min, lon_max=_lon_max,
+        )
+        tr = volcano_trace(clipped)
+        if tr is not None:
+            traces.append(tr)
 
     # ── Country borders ───────────────────────────────────────────────────────
     if show_borders:
-        sub_tomo = df[
-            (df['hq'] >= hq_min) &
-            (df['dep'] >= depth_range[0]) &
-            (df['dep'] <= depth_range[1])
-        ]
-        if len(sub_tomo):
-            tr = borders_trace(
-                lat_min=sub_tomo['lat'].min(), lat_max=sub_tomo['lat'].max(),
-                lon_min=sub_tomo['lon'].min(), lon_max=sub_tomo['lon'].max(),
-            )
-            if tr is not None:
-                traces.append(tr)
+        tr = borders_trace(
+            lat_min=_lat_min, lat_max=_lat_max,
+            lon_min=_lon_min, lon_max=_lon_max,
+        )
+        if tr is not None:
+            traces.append(tr)
 
     # ── Earthquakes ───────────────────────────────────────────────────────────
     if show_earthquakes and eq_df is not None and len(eq_df) > 0:
@@ -826,34 +862,6 @@ def build_figure(df, hq_min, iso_min, iso_max, n_surfaces, opacity,
                               cmin=eq_cmin, cmax=eq_cmax)
         if tr is not None:
             traces.append(tr)
-
-        # ── Magnitude bubble legend (fake traces, one per M level) ────────────
-        if eq_scale_mag and 'magnitude' in eq_df.columns:
-            mag_vals = eq_df['magnitude'].dropna()
-            mag_min  = int(np.floor(mag_vals.min()))
-            mag_max  = int(np.ceil(mag_vals.max()))
-            legend_mags = [m for m in range(max(0, mag_min), mag_max + 1)]
-            # Scatter3d legend icons ignore marker.size — use 2D Scatter instead
-            # so each legend entry shows the correct bubble size.
-            for m in legend_mags:
-                sz = float(np.clip(m ** 2 / 8, 0.5, 20))
-                traces.append(go.Scatter(
-                    x=[None], y=[None],
-                    mode='markers',
-                    name=f'M {m}',
-                    showlegend=True,
-                    legendgroup='magnitude',
-                    legendgrouptitle=dict(
-                        text='Magnitude',
-                        font=dict(color='#b0c4e8', size=11, family='monospace'),
-                    ) if m == legend_mags[0] else dict(text=''),
-                    marker=dict(
-                        size=sz,
-                        color='rgba(200,200,200,0.85)',
-                        line=dict(color='rgba(255,255,255,0.5)', width=1),
-                    ),
-                    xaxis='x', yaxis='y',
-                ))
 
     # ── XYZ anomaly surface ───────────────────────────────────────────────────
     if show_xyz and xyz_df is not None and len(xyz_df) >= 4:
@@ -873,6 +881,24 @@ def build_figure(df, hq_min, iso_min, iso_max, n_surfaces, opacity,
 
     fig = go.Figure(data=traces)
 
+    # Force the scene to the tomo domain by adding invisible corner markers
+    _lo0 = lon_range[0] if lon_range else float(df['lon'].min())
+    _lo1 = lon_range[1] if lon_range else float(df['lon'].max())
+    _la0 = lat_range[0] if lat_range else float(df['lat'].min())
+    _la1 = lat_range[1] if lat_range else float(df['lat'].max())
+    _z0  = -float(depth_range[1])
+    _z1  = -float(depth_range[0])
+    fig.add_trace(go.Scatter3d(
+        x=[_lo0, _lo1, _lo0, _lo1, _lo0, _lo1, _lo0, _lo1],
+        y=[_la0, _la0, _la1, _la1, _la0, _la0, _la1, _la1],
+        z=[_z0,  _z0,  _z0,  _z0,  _z1,  _z1,  _z1,  _z1],
+        mode='markers',
+        marker=dict(size=0.001, opacity=0),
+        showlegend=False,
+        hoverinfo='skip',
+        name='_bounds',
+    ))
+
     ax = dict(
         backgroundcolor='rgb(8,8,18)', gridcolor='rgb(50,50,70)',
         showbackground=True, zerolinecolor='rgb(80,80,100)',
@@ -886,6 +912,18 @@ def build_figure(df, hq_min, iso_min, iso_max, n_surfaces, opacity,
     z_ticks  = [-d for d in depths_in_range]
     z_labels = [f'{int(d)} km' for d in depths_in_range]
 
+    # Compute aspect ratio: scale x (lon) by cos(mean_lat) so 1° lon = 1° lat at mean lat
+    _mean_lat = np.radians(0.5 * (_la0 + _la1))
+    _lon_span = (_lo1 - _lo0) * np.cos(_mean_lat)
+    _lat_span = _la1 - _la0
+    _dep_span = float(depth_range[1] - depth_range[0])
+    # Normalise so the largest horizontal dimension = 2
+    _h_max = max(_lon_span, _lat_span, 1e-6)
+    _ax = round(2.0 * _lon_span / _h_max, 3)
+    _ay = round(2.0 * _lat_span / _h_max, 3)
+    _az = round(2.0 * (_dep_span / 111.0) / _h_max, 3)  # convert km→degrees equivalent
+    _az = max(0.3, min(_az, 1.5))  # clamp z so it doesn't get silly
+
     fig.update_layout(
         **_dark_layout(),
         scene=dict(
@@ -896,11 +934,8 @@ def build_figure(df, hq_min, iso_min, iso_max, n_surfaces, opacity,
             bgcolor='rgb(8,8,18)',
             camera=dict(eye=dict(x=1.4, y=1.4, z=0.9)),
             aspectmode='manual',
-            aspectratio=dict(x=2, y=2, z=1),
+            aspectratio=dict(x=_ax, y=_ay, z=_az),
         ),
-        # Hidden 2D axes for the magnitude-legend Scatter traces
-        xaxis=dict(visible=False, fixedrange=True),
-        yaxis=dict(visible=False, fixedrange=True),
     )
     return fig
 
@@ -1061,12 +1096,45 @@ except Exception as e:
     _vol_df = None
     _vol_msg = 'No volcano file loaded'
 
+# Earthquakes
+_EQ_PATH = 'eqs_NEIC_mag3.csv'
+try:
+    with open(_EQ_PATH, 'rb') as _f:
+        _eq_df, _eq_has_mag, _eq_err = parse_earthquakes(_f.read())
+    if _eq_err:
+        raise ValueError(_eq_err)
+    _eq_msg = f'{_EQ_PATH}  ({len(_eq_df):,} events)'
+    if _eq_has_mag:
+        _eq_msg += '  [mag col found]'
+    print(f'[startup] Loaded earthquakes: {_eq_msg}')
+except Exception as e:
+    print(f'[startup] Earthquake load failed: {e}')
+    _eq_df = None
+    _eq_has_mag = False
+    _eq_msg = 'No earthquake file loaded'
+
 _depths  = sorted(_df['dep'].unique())
 _vmin_g  = float(_df['%dvp'].min())
 _vmax_g  = float(_df['%dvp'].max())
-_dep_min = float(_depths[0])
-_dep_max = float(_depths[-1])
+_dep_min = _depths[0]
+_dep_max = _depths[-1]
 _iso_init = [_vmax_g * 0.3, _vmax_g * 0.8]
+# Default depth display range: skip outermost layer on each end [1:-1]
+_dep_default_min = _depths[1]  if len(_depths) > 2 else _dep_min
+_dep_default_max = _depths[-2] if len(_depths) > 2 else _dep_max
+# Default lat/lon limits: use slab extents if loaded, else tomo data extents
+if _slab is not None:
+    _lo, _la, _de = _slab
+    _valid = ~np.isnan(_de)
+    _lat_min_g = float(_la[_valid].min())
+    _lat_max_g = float(_la[_valid].max())
+    _lon_min_g = float(_lo[_valid].min())
+    _lon_max_g = float(_lo[_valid].max())
+else:
+    _lat_min_g = float(_df['lat'].min())
+    _lat_max_g = float(_df['lat'].max())
+    _lon_min_g = float(_df['lon'].min())
+    _lon_max_g = float(_df['lon'].max())
 
 print('[startup] Building initial figure...')
 _fig0 = build_figure(
@@ -1075,7 +1143,9 @@ _fig0 = build_figure(
     hq_min=0.1,
     n_surfaces=5, opacity=0.6,
     cs_name='Seismic (blue-white-red)',
-    depth_range=[_dep_min, _dep_max], ngrid=50,
+    depth_range=[_dep_default_min, _dep_default_max], ngrid=50,
+    lat_range=[_lat_min_g, _lat_max_g],
+    lon_range=[_lon_min_g, _lon_max_g],
     show_tomo=False,
     slab_data=_slab, show_slab=(_slab is not None), slab_opacity=0.6, slab_mode='surface',
     vol_df=_vol_df, show_volcanoes=(_vol_df is not None),
@@ -1100,10 +1170,17 @@ def _smarks(lo, hi, n=4):
             for v in np.linspace(lo, hi, n)}
 
 def _dmarks(depths):
+    """All depths are included as snap points; only every ~6th gets a label."""
     step = max(1, len(depths) // 6)
-    return {float(d): dict(label=str(int(d)),
-                           style=dict(color='#b0c4e8', fontSize='10px'))
-            for d in depths[::step]}
+    labelled = set(depths[::step])
+    return {
+        float(d): (
+            dict(label=str(int(d)), style=dict(color='#b0c4e8', fontSize='10px'))
+            if d in labelled
+            else dict(label='')
+        )
+        for d in depths
+    }
 
 def _status_div(msg, ok=True):
     return html.Div(msg, style=dict(
@@ -1173,11 +1250,22 @@ app.layout = html.Div(
 ::-webkit-scrollbar-thumb { background: rgb(45,45,85); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: rgb(65,65,115); }
 
-/* Hide number input spinners */
+/* Remove number input spinners */
 input[type=number]::-webkit-inner-spin-button,
-input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
-input[type=number] { -moz-appearance: textfield; appearance: textfield; }
-</style>''', dangerously_allow_html=True),
+input[type=number]::-webkit-outer-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+input[type=number] {
+    -moz-appearance: textfield;
+    appearance: textfield;
+}
+</style>
+<script>
+window.addEventListener('beforeunload', function() {
+    navigator.sendBeacon('/shutdown');
+});
+</script>''', dangerously_allow_html=True),
 
         html.Div(style=dict(marginBottom='20px'), children=[
             html.H1('TOMO VIEWER',
@@ -1200,6 +1288,87 @@ input[type=number] { -moz-appearance: textfield; appearance: textfield; }
                 scrollbarWidth='thin',
                 scrollbarColor='rgb(45,45,85) transparent',
             ), children=[
+
+                # ── Domain ───────────────────────────────────────────────────
+                html.Div(style=PANEL, children=[
+                    html.Span('DOMAIN', style=LBL),
+
+                    html.Span('LAT', style=SUB),
+                    html.Div(style=dict(display='flex', gap='8px', alignItems='center'), children=[
+                        html.Div(style=dict(flex='1'), children=[
+                            html.Span('MIN', style=dict(color='#b0c4e8', fontSize='9px',
+                                                         letterSpacing='2px', display='block',
+                                                         marginBottom='3px')),
+                            dcc.Input(id='lat-min', type='text',
+                                      value=str(round(_lat_min_g, 2)),
+                                      debounce=True,
+                                      style=dict(width='100%', boxSizing='border-box',
+                                                 background='rgb(10,10,22)',
+                                                 border='1px solid rgb(55,55,95)',
+                                                 borderRadius='4px', color='#6ab4ff',
+                                                 padding='5px 8px', fontSize='12px',
+                                                 fontFamily='monospace',
+                                                 MozAppearance='textfield',
+                                                 appearance='textfield')),
+                        ]),
+                        html.Span('→', style=dict(color='#445566', fontSize='14px',
+                                                   marginTop='16px')),
+                        html.Div(style=dict(flex='1'), children=[
+                            html.Span('MAX', style=dict(color='#b0c4e8', fontSize='9px',
+                                                         letterSpacing='2px', display='block',
+                                                         marginBottom='3px')),
+                            dcc.Input(id='lat-max', type='text',
+                                      value=str(round(_lat_max_g, 2)),
+                                      debounce=True,
+                                      style=dict(width='100%', boxSizing='border-box',
+                                                 background='rgb(10,10,22)',
+                                                 border='1px solid rgb(55,55,95)',
+                                                 borderRadius='4px', color='#6ab4ff',
+                                                 padding='5px 8px', fontSize='12px',
+                                                 fontFamily='monospace',
+                                                 MozAppearance='textfield',
+                                                 appearance='textfield')),
+                        ]),
+                    ]),
+
+                    html.Span('LON', style=SUB),
+                    html.Div(style=dict(display='flex', gap='8px', alignItems='center'), children=[
+                        html.Div(style=dict(flex='1'), children=[
+                            html.Span('MIN', style=dict(color='#b0c4e8', fontSize='9px',
+                                                         letterSpacing='2px', display='block',
+                                                         marginBottom='3px')),
+                            dcc.Input(id='lon-min', type='text',
+                                      value=str(round(_lon_min_g, 2)),
+                                      debounce=True,
+                                      style=dict(width='100%', boxSizing='border-box',
+                                                 background='rgb(10,10,22)',
+                                                 border='1px solid rgb(55,55,95)',
+                                                 borderRadius='4px', color='#6ab4ff',
+                                                 padding='5px 8px', fontSize='12px',
+                                                 fontFamily='monospace',
+                                                 MozAppearance='textfield',
+                                                 appearance='textfield')),
+                        ]),
+                        html.Span('→', style=dict(color='#445566', fontSize='14px',
+                                                   marginTop='16px')),
+                        html.Div(style=dict(flex='1'), children=[
+                            html.Span('MAX', style=dict(color='#b0c4e8', fontSize='9px',
+                                                         letterSpacing='2px', display='block',
+                                                         marginBottom='3px')),
+                            dcc.Input(id='lon-max', type='text',
+                                      value=str(round(_lon_max_g, 2)),
+                                      debounce=True,
+                                      style=dict(width='100%', boxSizing='border-box',
+                                                 background='rgb(10,10,22)',
+                                                 border='1px solid rgb(55,55,95)',
+                                                 borderRadius='4px', color='#6ab4ff',
+                                                 padding='5px 8px', fontSize='12px',
+                                                 fontFamily='monospace',
+                                                 MozAppearance='textfield',
+                                                 appearance='textfield')),
+                        ]),
+                    ]),
+                ]),
 
                 # ── Tomo upload ───────────────────────────────────────────────
                 html.Div(style=PANEL, children=[
@@ -1250,11 +1419,12 @@ input[type=number] { -moz-appearance: textfield; appearance: textfield; }
 
                     html.Span('DEPTH RANGE  (km)', style=SUB),
                     html.Div(id='depth-range-label',
-                             style=dict(fontSize='13px', color='#6ab4ff',
-                                        marginBottom='4px')),
+                             children=f'{int(_dep_default_min)} km  to  {int(_dep_default_max)} km',
+                             style=dict(fontSize='18px', color='#4af',
+                                        marginBottom='6px', fontWeight='300')),
                     dcc.RangeSlider(id='depth-range',
                                     min=_dep_min, max=_dep_max, step=None,
-                                    value=[_dep_min, _dep_max],
+                                    value=[_dep_default_min, _dep_default_max],
                                     marks=_dmarks(np.array(_depths)),
                                     tooltip={'always_visible': False}),
 
@@ -1269,15 +1439,17 @@ input[type=number] { -moz-appearance: textfield; appearance: textfield; }
                             html.Span('MIN', style=dict(color='#b0c4e8', fontSize='9px',
                                                          letterSpacing='2px', display='block',
                                                          marginBottom='3px')),
-                            dcc.Input(id='iso-min', type='number',
-                                      value=round(_iso_init[0], 4),
-                                      step=0.001, debounce=True,
+                            dcc.Input(id='iso-min', type='text',
+                                      value=str(round(_iso_init[0], 4)),
+                                      debounce=True,
                                       style=dict(width='100%', boxSizing='border-box',
                                                  background='rgb(10,10,22)',
                                                  border='1px solid rgb(55,55,95)',
                                                  borderRadius='4px', color='#6ab4ff',
                                                  padding='5px 8px', fontSize='12px',
-                                                 fontFamily='monospace')),
+                                                 fontFamily='monospace',
+                                                 MozAppearance='textfield',
+                                                 appearance='textfield')),
                         ]),
                         html.Span('→', style=dict(color='#445566', fontSize='14px',
                                                    marginTop='16px')),
@@ -1285,15 +1457,17 @@ input[type=number] { -moz-appearance: textfield; appearance: textfield; }
                             html.Span('MAX', style=dict(color='#b0c4e8', fontSize='9px',
                                                          letterSpacing='2px', display='block',
                                                          marginBottom='3px')),
-                            dcc.Input(id='iso-max', type='number',
-                                      value=round(_iso_init[1], 4),
-                                      step=0.001, debounce=True,
+                            dcc.Input(id='iso-max', type='text',
+                                      value=str(round(_iso_init[1], 4)),
+                                      debounce=True,
                                       style=dict(width='100%', boxSizing='border-box',
                                                  background='rgb(10,10,22)',
                                                  border='1px solid rgb(55,55,95)',
                                                  borderRadius='4px', color='#6ab4ff',
                                                  padding='5px 8px', fontSize='12px',
-                                                 fontFamily='monospace')),
+                                                 fontFamily='monospace',
+                                                 MozAppearance='textfield',
+                                                 appearance='textfield')),
                         ]),
                     ]),
                     html.Div(id='iso-data-range',
@@ -1445,13 +1619,13 @@ input[type=number] { -moz-appearance: textfield; appearance: textfield; }
 
                     html.Div(
                         id='eq-status',
-                        children=_status_div('No earthquake file loaded', ok=False)
+                        children=_status_div(_eq_msg, ok=(_eq_df is not None))
                     ),
 
                     dcc.Checklist(
                         id='show-eq',
                         options=[{'label': ' Show earthquakes', 'value': 'show'}],
-                        value=[],
+                        value=['show'] if _eq_df is not None else [],
                         inline=True,
                         inputClassName='radio-input',
                         labelClassName='radio-label',
@@ -1461,7 +1635,7 @@ input[type=number] { -moz-appearance: textfield; appearance: textfield; }
                     # ── Magnitude scaling toggle ────────────────────────────────
                     html.Div(
                         id='eq-mag-row',
-                        style=dict(marginTop='6px'),
+                        style=dict(marginTop='6px', display='block') if _eq_has_mag else dict(marginTop='6px', display='none'),
                         children=[
 
                         dcc.Checklist(
@@ -1478,24 +1652,61 @@ input[type=number] { -moz-appearance: textfield; appearance: textfield; }
 
                     dcc.Input(
                         id='eq-min-mag',
-                        type='number',
-                        value=0,
-                        min=-999,
-                        max=999,
-                        step=0.1,
+                        type='text',
+                        value='0',
                         debounce=True,
                         style=dict(
-                        width='100%',
-                        boxSizing='border-box',
-                        background='rgb(10,10,22)',
-                        border='1px solid rgb(55,55,95)',
-                        borderRadius='4px',
-                        color='#6ab4ff',
-                        padding='6px 8px',
-                        fontSize='12px',
-                        fontFamily='monospace'
+                            width='100%',
+                            boxSizing='border-box',
+                            background='rgb(10,10,22)',
+                            border='1px solid rgb(55,55,95)',
+                            borderRadius='4px',
+                            color='#6ab4ff',
+                            padding='6px 8px',
+                            fontSize='12px',
+                            fontFamily='monospace',
+                            MozAppearance='textfield',
+                            appearance='textfield',
                         ),
                     ),
+
+                    html.Span('DEPTH RANGE  (km)', style={**SUB, 'marginTop': '8px'}),
+                    html.Div(style=dict(display='flex', gap='8px', alignItems='center'), children=[
+                        html.Div(style=dict(flex='1'), children=[
+                            html.Span('MIN', style=dict(color='#b0c4e8', fontSize='9px',
+                                                         letterSpacing='2px', display='block',
+                                                         marginBottom='3px')),
+                            dcc.Input(id='eq-dep-min', type='text',
+                                      value=str(int(_dep_min)),
+                                      debounce=True,
+                                      style=dict(width='100%', boxSizing='border-box',
+                                                 background='rgb(10,10,22)',
+                                                 border='1px solid rgb(55,55,95)',
+                                                 borderRadius='4px', color='#6ab4ff',
+                                                 padding='5px 8px', fontSize='12px',
+                                                 fontFamily='monospace',
+                                                 MozAppearance='textfield',
+                                                 appearance='textfield')),
+                        ]),
+                        html.Span('→', style=dict(color='#445566', fontSize='14px',
+                                                   marginTop='16px')),
+                        html.Div(style=dict(flex='1'), children=[
+                            html.Span('MAX', style=dict(color='#b0c4e8', fontSize='9px',
+                                                         letterSpacing='2px', display='block',
+                                                         marginBottom='3px')),
+                            dcc.Input(id='eq-dep-max', type='text',
+                                      value=str(int(_dep_max)),
+                                      debounce=True,
+                                      style=dict(width='100%', boxSizing='border-box',
+                                                 background='rgb(10,10,22)',
+                                                 border='1px solid rgb(55,55,95)',
+                                                 borderRadius='4px', color='#6ab4ff',
+                                                 padding='5px 8px', fontSize='12px',
+                                                 fontFamily='monospace',
+                                                 MozAppearance='textfield',
+                                                 appearance='textfield')),
+                        ]),
+                    ]),
                 ]
             ),
         ]),
@@ -1583,7 +1794,7 @@ input[type=number] { -moz-appearance: textfield; appearance: textfield; }
         dcc.Store(id='vel-label',  data=_vel_label),
         dcc.Store(id='slab-store', data=_encode_slab(_slab) if _slab is not None else None),
         dcc.Store(id='vol-store',  data=_vol_df.to_dict('list') if _vol_df is not None else None),
-        dcc.Store(id='eq-store',   data=None),
+        dcc.Store(id='eq-store',   data=_eq_df.to_dict('list') if _eq_df is not None else None),
         dcc.Store(id='xyz-store',  data=None),
     ]
 )
@@ -1602,6 +1813,10 @@ input[type=number] { -moz-appearance: textfield; appearance: textfield; }
     Output('depth-range', 'max'),
     Output('depth-range', 'value'),
     Output('depth-range', 'marks'),
+    Output('lat-min',     'value'),
+    Output('lat-max',     'value'),
+    Output('lon-min',     'value'),
+    Output('lon-max',     'value'),
     Input('upload-tomo',  'contents'),
     State('upload-tomo',  'filename'),
     prevent_initial_call=True,
@@ -1613,19 +1828,27 @@ def load_tomo(contents, filename):
     df, vel_label, err = parse_tomo(base64.b64decode(b64), wave_type='vp')
     if err:
         return ([dash.no_update] * 2 + [_status_div(f'Error: {err}', ok=False)] +
-                [dash.no_update] * 7)
+                [dash.no_update] * 11)
     vmin, vmax = float(df['%dvp'].min()), float(df['%dvp'].max())
     depths = sorted(df['dep'].unique())
-    dep_min, dep_max = float(depths[0]), float(depths[-1])
-    iso_min_val = round(vmax * 0.3, 4)
-    iso_max_val = round(vmax * 0.8, 4)
+    dep_min, dep_max = depths[0], depths[-1]
+    # Default to inner layers [1:-1]
+    dep_val_min = depths[1]  if len(depths) > 2 else dep_min
+    dep_val_max = depths[-2] if len(depths) > 2 else dep_max
+    iso_min_val = str(round(vmax * 0.3, 4))
+    iso_max_val = str(round(vmax * 0.8, 4))
     data_range_txt = f'data: {vmin:.4f} → {vmax:.4f}'
+    lat_min_v = str(round(float(df['lat'].min()), 2))
+    lat_max_v = str(round(float(df['lat'].max()), 2))
+    lon_min_v = str(round(float(df['lon'].min()), 2))
+    lon_max_v = str(round(float(df['lon'].max()), 2))
     return (
         df.to_dict('list'),
         vel_label,
         _status_div(f'{filename}  ({len(df):,} pts)  [{vel_label}]'),
         iso_min_val, iso_max_val, data_range_txt,
-        dep_min, dep_max, [dep_min, dep_max], _dmarks(np.array(depths)),
+        dep_min, dep_max, [dep_val_min, dep_val_max], _dmarks(np.array(depths)),
+        lat_min_v, lat_max_v, lon_min_v, lon_max_v,
     )
 
 
@@ -1751,13 +1974,21 @@ def load_xyz(contents, filename):
     Input('xyz-opacity',  'value'),
     Input('xyz-colorscale', 'value'),
     Input('xyz-ngrid',    'value'),
+    Input('lat-min',      'value'),
+    Input('lat-max',      'value'),
+    Input('lon-min',      'value'),
+    Input('lon-max',      'value'),
+    Input('eq-dep-min',   'value'),
+    Input('eq-dep-max',   'value'),
 )
 def update_figure(tomo_store, vel_label, slab_store, vol_store, hq_min, iso_min, iso_max,
                   n_surf, opacity, cs_name, depth_range, ngrid,
                   slab_op, slab_mode, eq_store, eq_min_mag,
                   show_vol_val, show_eq_val, eq_scale_val, show_slab_val, show_borders_val,
                   show_tomo_val,
-                  xyz_store, show_xyz_val, xyz_opacity, xyz_colorscale, xyz_ngrid):
+                  xyz_store, show_xyz_val, xyz_opacity, xyz_colorscale, xyz_ngrid,
+                  lat_min_val, lat_max_val, lon_min_val, lon_max_val,
+                  eq_dep_min_val, eq_dep_max_val):
     df = pd.DataFrame(tomo_store)
     vel_label = vel_label or '%dVp'
     slab = _decode_slab(slab_store)
@@ -1767,8 +1998,13 @@ def update_figure(tomo_store, vel_label, slab_store, vol_store, hq_min, iso_min,
     show_borders = bool(show_borders_val)
     show_tomo    = bool(show_tomo_val)
     eq_df        = pd.DataFrame(eq_store) if eq_store else None
-    if eq_df is not None and 'magnitude' in eq_df.columns:
-        eq_df = eq_df[eq_df['magnitude'].fillna(0) >= (eq_min_mag or 0)]
+    if eq_df is not None:
+        try:
+            min_mag = float(eq_min_mag) if eq_min_mag not in (None, '') else 0.0
+        except (TypeError, ValueError):
+            min_mag = 0.0
+        if 'magnitude' in eq_df.columns:
+            eq_df = eq_df[eq_df['magnitude'].fillna(0) >= min_mag]
     show_eq      = bool(show_eq_val)
     eq_scale_mag = bool(eq_scale_val)
     xyz_df       = pd.DataFrame(xyz_store) if xyz_store else None
@@ -1777,13 +2013,40 @@ def update_figure(tomo_store, vel_label, slab_store, vol_store, hq_min, iso_min,
     xyz_colorscale = xyz_colorscale or 'Plasma'
     xyz_ngrid    = xyz_ngrid    if xyz_ngrid    is not None else 60
 
-    # Guard against None if inputs not yet set
-    iso_min = iso_min if iso_min is not None else _vmin_g
-    iso_max = iso_max if iso_max is not None else _vmax_g
+    # Guard against None if inputs not yet set — inputs are now type='text', parse as float
+    def _parse_float(val, fallback):
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return fallback
+
+    iso_min = _parse_float(iso_min, _vmin_g)
+    iso_max = _parse_float(iso_max, _vmax_g)
+
+    # Lat/lon limits (fall back to data extents if not set)
+    lat_range = [
+        _parse_float(lat_min_val, float(df['lat'].min())),
+        _parse_float(lat_max_val, float(df['lat'].max())),
+    ]
+    lon_range = [
+        _parse_float(lon_min_val, float(df['lon'].min())),
+        _parse_float(lon_max_val, float(df['lon'].max())),
+    ]
+    eq_dep_min = _parse_float(eq_dep_min_val, float(_dep_min))
+    eq_dep_max = _parse_float(eq_dep_max_val, float(_dep_max))
+
+    # Apply lat/lon/depth limits to earthquakes
+    if eq_df is not None and len(eq_df):
+        eq_df = eq_df[
+            (eq_df['lat']   >= lat_range[0]) & (eq_df['lat']   <= lat_range[1]) &
+            (eq_df['lon']   >= lon_range[0]) & (eq_df['lon']   <= lon_range[1]) &
+            (eq_df['depth'] >= eq_dep_min)   & (eq_df['depth'] <= eq_dep_max)
+        ]
 
     fig = build_figure(
         df, hq_min, iso_min, iso_max,
         n_surf, opacity, cs_name, depth_range, ngrid,
+        lat_range=lat_range, lon_range=lon_range,
         show_tomo=show_tomo,
         slab_data=slab, show_slab=show_slab, slab_opacity=slab_op, slab_mode=slab_mode or 'surface',
         vol_df=vol_df, show_volcanoes=show_vol,
@@ -1796,7 +2059,11 @@ def update_figure(tomo_store, vel_label, slab_store, vol_store, hq_min, iso_min,
     sub = df[
         (df['hq'] >= hq_min) &
         (df['dep'] >= depth_range[0]) &
-        (df['dep'] <= depth_range[1])
+        (df['dep'] <= depth_range[1]) &
+        (df['lat'] >= lat_range[0]) &
+        (df['lat'] <= lat_range[1]) &
+        (df['lon'] >= lon_range[0]) &
+        (df['lon'] <= lon_range[1])
     ]
     v = sub['%dvp'].values if len(sub) else np.array([0.])
     stats = [
@@ -1805,11 +2072,9 @@ def update_figure(tomo_store, vel_label, slab_store, vol_store, hq_min, iso_min,
         html.Div(f'{vel_label} MAX   {v.max():.4f}'),
         html.Div(f'{vel_label} MEAN  {v.mean():.4f}'),
         html.Div(f'{vel_label} STD   {v.std():.4f}'),
-        html.Div(f'DEPTH      {int(depth_range[0])}-{int(depth_range[1])} km'),
-        html.Div(f'LAT        {sub["lat"].min():.1f} to {sub["lat"].max():.1f}'
-                 if len(sub) else 'LAT  -'),
-        html.Div(f'LON        {sub["lon"].min():.1f} to {sub["lon"].max():.1f}'
-                 if len(sub) else 'LON  -'),
+        html.Div(f'DEPTH      {int(depth_range[0])}-{int(depth_range[1])} km' if depth_range else 'DEPTH  —'),
+        html.Div(f'LAT        {lat_range[0]:.2f} to {lat_range[1]:.2f}'),
+        html.Div(f'LON        {lon_range[0]:.2f} to {lon_range[1]:.2f}'),
     ]
     if slab is not None:
         lo, la, de = slab
@@ -1818,11 +2083,11 @@ def update_figure(tomo_store, vel_label, slab_store, vol_store, hq_min, iso_min,
             html.Div(f'SLAB DEPTH {valid.min():.0f}-{valid.max():.0f} km',
                      style=dict(color='#7df')),
         ]
-    if vol_df is not None and show_vol and len(sub):
+    if vol_df is not None and show_vol:
         clipped = filter_volcanoes_to_region(
             vol_df,
-            lat_min=sub['lat'].min(), lat_max=sub['lat'].max(),
-            lon_min=sub['lon'].min(), lon_max=sub['lon'].max(),
+            lat_min=lat_range[0], lat_max=lat_range[1],
+            lon_min=lon_range[0], lon_max=lon_range[1],
         )
         stats += [
             html.Div(f'VOLCANOES  {len(clipped)} in region',
@@ -1830,7 +2095,8 @@ def update_figure(tomo_store, vel_label, slab_store, vol_store, hq_min, iso_min,
         ]
     if eq_df is not None and show_eq:
         stats += [
-            html.Div(f'EARTHQUAKES  {len(eq_df):,} events',
+            html.Div(f'EARTHQUAKES  {len(eq_df):,} events  '
+                     f'dep {eq_dep_min:.0f}-{eq_dep_max:.0f} km',
                      style=dict(color='#ffdd88')),
         ]
     if xyz_df is not None and show_xyz:
@@ -1844,7 +2110,7 @@ def update_figure(tomo_store, vel_label, slab_store, vol_store, hq_min, iso_min,
         fig, stats,
         f'{opacity:.0%}',
         f'{vel_label}  {iso_min:.4f}  →  {iso_max:.4f}',
-        f'{int(depth_range[0])} km  to  {int(depth_range[1])} km',
+        f'{int(depth_range[0])} km  to  {int(depth_range[1])} km' if depth_range else '— km  to  — km',
         f'{ngrid} x {ngrid}',
         f'{vel_label}  ISO RANGE',
     )
