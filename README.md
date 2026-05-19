@@ -115,22 +115,6 @@ Renders an arbitrary 3D point cloud as a smooth isosurface blob. Useful for visu
 
 ---
 
-## Interpolation
-
-Tomography data is interpolated onto a regular grid using a two-step process per depth layer:
-
-1. **Blockmean** — averages scattered points into grid cells (equivalent to GMT `blockmean`)
-2. **Thin-plate spline** (via `scipy.interpolate.RBFInterpolator`) — fits a smooth minimum-curvature surface
-3. **HQ proximity mask** — grid nodes further than ~2 cell-widths from any real data point are zeroed to suppress extrapolation artefacts
-
----
-
-## Aspect ratio
-
-The 3D scene aspect ratio is computed automatically from the domain extent using a cosine-latitude correction so that 1° of longitude and 1° of latitude have the correct relative physical size at the mean latitude of the domain (equirectangular projection).
-
----
-
 ## Notes
 
 - Natural Earth country borders are downloaded automatically on first run (~500 KB zip) and cached locally as `ne_110m_admin_0_countries_lakes.shp`.
