@@ -1120,8 +1120,8 @@ _dep_min = _depths[0]
 _dep_max = _depths[-1]
 _iso_init = [_vmax_g * 0.3, _vmax_g * 0.8]
 # Default depth display range: skip outermost layer on each end [1:-1]
-_dep_default_min = _depths[1]  if len(_depths) > 2 else _dep_min
-_dep_default_max = _depths[-2] if len(_depths) > 2 else _dep_max
+_dep_default_min = _depths[2]  if len(_depths) > 2 else _dep_min
+_dep_default_max = _depths[-3] if len(_depths) > 2 else _dep_max
 # Default lat/lon limits: use slab extents if loaded, else tomo data extents
 if _slab is not None:
     _lo, _la, _de = _slab
@@ -1169,18 +1169,6 @@ def _smarks(lo, hi, n=4):
                            style=dict(color='#b0c4e8', fontSize='10px'))
             for v in np.linspace(lo, hi, n)}
 
-def _dmarks(depths):
-    """All depths are included as snap points; only every ~6th gets a label."""
-    step = max(1, len(depths) // 6)
-    labelled = set(depths[::step])
-    return {
-        float(d): (
-            dict(label=str(int(d)), style=dict(color='#b0c4e8', fontSize='10px'))
-            if d in labelled
-            else dict(label='')
-        )
-        for d in depths
-    }
 
 def _status_div(msg, ok=True):
     return html.Div(msg, style=dict(
@@ -1418,15 +1406,42 @@ window.addEventListener('beforeunload', function() {
                     ),
 
                     html.Span('DEPTH RANGE  (km)', style=SUB),
-                    html.Div(id='depth-range-label',
-                             children=f'{int(_dep_default_min)} km  to  {int(_dep_default_max)} km',
-                             style=dict(fontSize='18px', color='#4af',
-                                        marginBottom='6px', fontWeight='300')),
-                    dcc.RangeSlider(id='depth-range',
-                                    min=_dep_min, max=_dep_max, step=None,
-                                    value=[_dep_default_min, _dep_default_max],
-                                    marks=_dmarks(np.array(_depths)),
-                                    tooltip={'always_visible': False}),
+                    html.Div(style=dict(display='flex', gap='8px', alignItems='center'), children=[
+                        html.Div(style=dict(flex='1'), children=[
+                            html.Span('MIN', style=dict(color='#b0c4e8', fontSize='9px',
+                                                         letterSpacing='2px', display='block',
+                                                         marginBottom='3px')),
+                            dcc.Input(id='depth-min', type='text',
+                                      value=str(int(_dep_default_min)),
+                                      debounce=True,
+                                      style=dict(width='100%', boxSizing='border-box',
+                                                 background='rgb(10,10,22)',
+                                                 border='1px solid rgb(55,55,95)',
+                                                 borderRadius='4px', color='#6ab4ff',
+                                                 padding='5px 8px', fontSize='12px',
+                                                 fontFamily='monospace',
+                                                 MozAppearance='textfield',
+                                                 appearance='textfield')),
+                        ]),
+                        html.Span('→', style=dict(color='#445566', fontSize='14px',
+                                                   marginTop='16px')),
+                        html.Div(style=dict(flex='1'), children=[
+                            html.Span('MAX', style=dict(color='#b0c4e8', fontSize='9px',
+                                                         letterSpacing='2px', display='block',
+                                                         marginBottom='3px')),
+                            dcc.Input(id='depth-max', type='text',
+                                      value=str(int(_dep_default_max)),
+                                      debounce=True,
+                                      style=dict(width='100%', boxSizing='border-box',
+                                                 background='rgb(10,10,22)',
+                                                 border='1px solid rgb(55,55,95)',
+                                                 borderRadius='4px', color='#6ab4ff',
+                                                 padding='5px 8px', fontSize='12px',
+                                                 fontFamily='monospace',
+                                                 MozAppearance='textfield',
+                                                 appearance='textfield')),
+                        ]),
+                    ]),
 
                     html.Span(id='iso-range-header',
                               children=f'{_vel_label}  ISO RANGE', style=SUB),
@@ -1809,10 +1824,8 @@ window.addEventListener('beforeunload', function() {
     Output('iso-min',     'value'),
     Output('iso-max',     'value'),
     Output('iso-data-range', 'children'),
-    Output('depth-range', 'min'),
-    Output('depth-range', 'max'),
-    Output('depth-range', 'value'),
-    Output('depth-range', 'marks'),
+    Output('depth-min',   'value'),
+    Output('depth-max',   'value'),
     Output('lat-min',     'value'),
     Output('lat-max',     'value'),
     Output('lon-min',     'value'),
@@ -1828,13 +1841,11 @@ def load_tomo(contents, filename):
     df, vel_label, err = parse_tomo(base64.b64decode(b64), wave_type='vp')
     if err:
         return ([dash.no_update] * 2 + [_status_div(f'Error: {err}', ok=False)] +
-                [dash.no_update] * 11)
+                [dash.no_update] * 9)
     vmin, vmax = float(df['%dvp'].min()), float(df['%dvp'].max())
     depths = sorted(df['dep'].unique())
-    dep_min, dep_max = depths[0], depths[-1]
-    # Default to inner layers [1:-1]
-    dep_val_min = depths[1]  if len(depths) > 2 else dep_min
-    dep_val_max = depths[-2] if len(depths) > 2 else dep_max
+    dep_val_min = depths[1]  if len(depths) > 2 else depths[0]
+    dep_val_max = depths[-2] if len(depths) > 2 else depths[-1]
     iso_min_val = str(round(vmax * 0.3, 4))
     iso_max_val = str(round(vmax * 0.8, 4))
     data_range_txt = f'data: {vmin:.4f} → {vmax:.4f}'
@@ -1847,7 +1858,7 @@ def load_tomo(contents, filename):
         vel_label,
         _status_div(f'{filename}  ({len(df):,} pts)  [{vel_label}]'),
         iso_min_val, iso_max_val, data_range_txt,
-        dep_min, dep_max, [dep_val_min, dep_val_max], _dmarks(np.array(depths)),
+        str(int(dep_val_min)), str(int(dep_val_max)),
         lat_min_v, lat_max_v, lon_min_v, lon_max_v,
     )
 
@@ -1944,7 +1955,6 @@ def load_xyz(contents, filename):
     Output('stats-panel',       'children'),
     Output('opacity-label',     'children'),
     Output('iso-range-label',   'children'),
-    Output('depth-range-label', 'children'),
     Output('ngrid-label',       'children'),
     Output('iso-range-header',  'children'),
     Input('tomo-store',    'data'),
@@ -1957,7 +1967,8 @@ def load_xyz(contents, filename):
     Input('n-surfaces',    'value'),
     Input('opacity-slider','value'),
     Input('cs-picker',     'value'),
-    Input('depth-range',   'value'),
+    Input('depth-min',      'value'),
+    Input('depth-max',      'value'),
     Input('ngrid-slider',  'value'),
     Input('slab-opacity',  'value'),
     Input('slab-mode',     'value'),
@@ -1982,7 +1993,7 @@ def load_xyz(contents, filename):
     Input('eq-dep-max',   'value'),
 )
 def update_figure(tomo_store, vel_label, slab_store, vol_store, hq_min, iso_min, iso_max,
-                  n_surf, opacity, cs_name, depth_range, ngrid,
+                  n_surf, opacity, cs_name, depth_min_val, depth_max_val, ngrid,
                   slab_op, slab_mode, eq_store, eq_min_mag,
                   show_vol_val, show_eq_val, eq_scale_val, show_slab_val, show_borders_val,
                   show_tomo_val,
@@ -2022,6 +2033,11 @@ def update_figure(tomo_store, vel_label, slab_store, vol_store, hq_min, iso_min,
 
     iso_min = _parse_float(iso_min, _vmin_g)
     iso_max = _parse_float(iso_max, _vmax_g)
+
+    depth_range = [
+        _parse_float(depth_min_val, float(_dep_min)),
+        _parse_float(depth_max_val, float(_dep_max)),
+    ]
 
     # Lat/lon limits (fall back to data extents if not set)
     lat_range = [
@@ -2110,7 +2126,6 @@ def update_figure(tomo_store, vel_label, slab_store, vol_store, hq_min, iso_min,
         fig, stats,
         f'{opacity:.0%}',
         f'{vel_label}  {iso_min:.4f}  →  {iso_max:.4f}',
-        f'{int(depth_range[0])} km  to  {int(depth_range[1])} km' if depth_range else '— km  to  — km',
         f'{ngrid} x {ngrid}',
         f'{vel_label}  ISO RANGE',
     )
