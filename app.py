@@ -39,13 +39,13 @@ def shutdown():
 
 # ── Colorscales ───────────────────────────────────────────────────────────────
 SEISMIC_SCALE = [
-    [0.00, 'rgb(0,0,160)'],
-    [0.20, 'rgb(30,144,255)'],
-    [0.45, 'rgb(200,220,255)'],
+    [0.00, 'rgb(160,0,0)'],
+    [0.20, 'rgb(255,80,0)'],
+    [0.45, 'rgb(255,220,200)'],
     [0.50, 'rgb(255,255,255)'],
-    [0.55, 'rgb(255,220,200)'],
-    [0.80, 'rgb(255,80,0)'],
-    [1.00, 'rgb(160,0,0)'],
+    [0.55, 'rgb(200,220,255)'],
+    [0.80, 'rgb(30,144,255)'],
+    [1.00, 'rgb(0,0,160)'],
 ]
 COLORSCALE_OPTIONS = {
     'Seismic (blue-white-red)': SEISMIC_SCALE,
@@ -760,7 +760,8 @@ def build_figure(df, hq_min, iso_min, iso_max, n_surfaces, opacity,
                  eq_scale_mag=False,
                  show_tomo=True,
                  xyz_df=None, show_xyz=False, xyz_opacity=0.7,
-                 xyz_colorscale='Plasma', xyz_ngrid=60):
+                 xyz_colorscale='Plasma', xyz_ngrid=60,
+                 cscale_min=None, cscale_max=None):
 
     traces = []
 
@@ -779,12 +780,44 @@ def build_figure(df, hq_min, iso_min, iso_max, n_surfaces, opacity,
         iso_min_c = max(iso_min_c, vmin + eps)
         iso_max_c = min(iso_max_c, vmax - eps)
 
+        # Color scale bounds: use explicit overrides if provided, else match iso range
+        cs_cmin = cscale_min if cscale_min is not None else iso_min_c
+        cs_cmax = cscale_max if cscale_max is not None else iso_max_c
+
+        # For seismic-style scales, zero-centre the colorscale so that data value 0
+        # always maps to white (midpoint), negative → red, positive → blue.
+        def _zero_centre_scale(scale, cmin, cmax):
+            """Remap a symmetric colorscale so its midpoint sits at data value 0."""
+            if not isinstance(scale, list):
+                return scale, False   # named scale, cannot remap; keep reversescale
+            total = cmax - cmin
+            if total <= 0:
+                return scale, False
+            zero_frac = (0.0 - cmin) / total   # where 0 falls in [cmin, cmax]
+            zero_frac = max(0.0, min(1.0, zero_frac))
+            # Remap each stop: stops < 0.5 map to [0, zero_frac],
+            # stops >= 0.5 map to [zero_frac, 1]
+            new_scale = []
+            for pos, color in scale:
+                if pos <= 0.5:
+                    new_pos = pos * 2.0 * zero_frac
+                else:
+                    new_pos = zero_frac + (pos - 0.5) * 2.0 * (1.0 - zero_frac)
+                new_scale.append([round(new_pos, 6), color])
+            return new_scale, False   # reversescale=False; mapping already correct
+
+        if isinstance(cs, list):
+            cs_mapped, do_reverse = _zero_centre_scale(cs, cs_cmin, cs_cmax)
+        else:
+            cs_mapped, do_reverse = cs, True   # non-seismic named scales keep original behaviour
+
         traces.append(go.Isosurface(
             x=x.tolist(), y=y.tolist(), z=z.tolist(),
             value=v.tolist(),
             isomin=iso_min_c, isomax=iso_max_c,
             surface_count=n_surfaces,
-            colorscale=cs, reversescale=True,
+            colorscale=cs_mapped, reversescale=do_reverse,
+            cmin=cs_cmin, cmax=cs_cmax,
             showscale=True,
             caps=dict(x_show=False, y_show=False, z_show=False),
             opacity=opacity,
@@ -1530,6 +1563,53 @@ window.addEventListener('beforeunload', function() {
                                             color='#ccd8ee', fontSize='12px',
                                             border='1px solid rgb(55,55,95)',
                                             borderRadius='4px')),
+
+                    html.Span('COLOR SCALE RANGE', style=SUB),
+                    html.Div(id='cscale-range-label',
+                             style=dict(fontSize='10px', color='#8fa8cc',
+                                        marginBottom='6px', letterSpacing='1px')),
+                    html.Div(style=dict(display='flex', gap='8px',
+                                        alignItems='center'), children=[
+                        html.Div(style=dict(flex='1'), children=[
+                            html.Span('MIN', style=dict(color='#b0c4e8', fontSize='9px',
+                                                         letterSpacing='2px', display='block',
+                                                         marginBottom='3px')),
+                            dcc.Input(id='cscale-min', type='text',
+                                      value='',
+                                      placeholder='auto',
+                                      debounce=True,
+                                      style=dict(width='100%', boxSizing='border-box',
+                                                 background='rgb(10,10,22)',
+                                                 border='1px solid rgb(55,55,95)',
+                                                 borderRadius='4px', color='#6ab4ff',
+                                                 padding='5px 8px', fontSize='12px',
+                                                 fontFamily='monospace',
+                                                 MozAppearance='textfield',
+                                                 appearance='textfield')),
+                        ]),
+                        html.Span('→', style=dict(color='#445566', fontSize='14px',
+                                                   marginTop='16px')),
+                        html.Div(style=dict(flex='1'), children=[
+                            html.Span('MAX', style=dict(color='#b0c4e8', fontSize='9px',
+                                                         letterSpacing='2px', display='block',
+                                                         marginBottom='3px')),
+                            dcc.Input(id='cscale-max', type='text',
+                                      value='',
+                                      placeholder='auto',
+                                      debounce=True,
+                                      style=dict(width='100%', boxSizing='border-box',
+                                                 background='rgb(10,10,22)',
+                                                 border='1px solid rgb(55,55,95)',
+                                                 borderRadius='4px', color='#6ab4ff',
+                                                 padding='5px 8px', fontSize='12px',
+                                                 fontFamily='monospace',
+                                                 MozAppearance='textfield',
+                                                 appearance='textfield')),
+                        ]),
+                    ]),
+                    html.P('Leave blank to auto-fit to iso range',
+                           style=dict(color='#7a90a8', fontSize='10px',
+                                      margin='5px 0 0 0')),
                 ]),
 
                 # ── Slab upload ───────────────────────────────────────────────
@@ -1957,6 +2037,7 @@ def load_xyz(contents, filename):
     Output('iso-range-label',   'children'),
     Output('ngrid-label',       'children'),
     Output('iso-range-header',  'children'),
+    Output('cscale-range-label','children'),
     Input('tomo-store',    'data'),
     Input('vel-label',     'data'),
     Input('slab-store',    'data'),
@@ -1991,6 +2072,8 @@ def load_xyz(contents, filename):
     Input('lon-max',      'value'),
     Input('eq-dep-min',   'value'),
     Input('eq-dep-max',   'value'),
+    Input('cscale-min',   'value'),
+    Input('cscale-max',   'value'),
 )
 def update_figure(tomo_store, vel_label, slab_store, vol_store, hq_min, iso_min, iso_max,
                   n_surf, opacity, cs_name, depth_min_val, depth_max_val, ngrid,
@@ -1999,7 +2082,8 @@ def update_figure(tomo_store, vel_label, slab_store, vol_store, hq_min, iso_min,
                   show_tomo_val,
                   xyz_store, show_xyz_val, xyz_opacity, xyz_colorscale, xyz_ngrid,
                   lat_min_val, lat_max_val, lon_min_val, lon_max_val,
-                  eq_dep_min_val, eq_dep_max_val):
+                  eq_dep_min_val, eq_dep_max_val,
+                  cscale_min_val, cscale_max_val):
     df = pd.DataFrame(tomo_store)
     vel_label = vel_label or '%dVp'
     slab = _decode_slab(slab_store)
@@ -2051,6 +2135,10 @@ def update_figure(tomo_store, vel_label, slab_store, vol_store, hq_min, iso_min,
     eq_dep_min = _parse_float(eq_dep_min_val, float(_dep_min))
     eq_dep_max = _parse_float(eq_dep_max_val, float(_dep_max))
 
+    # Color scale bounds (None = auto, i.e. match iso range)
+    cscale_min = _parse_float(cscale_min_val, None) if cscale_min_val not in (None, '') else None
+    cscale_max = _parse_float(cscale_max_val, None) if cscale_max_val not in (None, '') else None
+
     # Apply lat/lon/depth limits to earthquakes
     if eq_df is not None and len(eq_df):
         eq_df = eq_df[
@@ -2070,6 +2158,7 @@ def update_figure(tomo_store, vel_label, slab_store, vol_store, hq_min, iso_min,
         eq_df=eq_df, show_earthquakes=show_eq, eq_scale_mag=eq_scale_mag,
         xyz_df=xyz_df, show_xyz=show_xyz, xyz_opacity=xyz_opacity,
         xyz_colorscale=xyz_colorscale, xyz_ngrid=xyz_ngrid,
+        cscale_min=cscale_min, cscale_max=cscale_max,
     )
 
     sub = df[
@@ -2122,12 +2211,22 @@ def update_figure(tomo_store, vel_label, slab_store, vol_store, hq_min, iso_min,
                      style=dict(color='#d488ff')),
         ]
 
+    if cscale_min is not None and cscale_max is not None:
+        cscale_label = f'{cscale_min:.4f}  →  {cscale_max:.4f}'
+    elif cscale_min is not None:
+        cscale_label = f'{cscale_min:.4f}  →  auto'
+    elif cscale_max is not None:
+        cscale_label = f'auto  →  {cscale_max:.4f}'
+    else:
+        cscale_label = 'auto (follows iso range)'
+
     return (
         fig, stats,
         f'{opacity:.0%}',
         f'{vel_label}  {iso_min:.4f}  →  {iso_max:.4f}',
         f'{ngrid} x {ngrid}',
         f'{vel_label}  ISO RANGE',
+        cscale_label,
     )
 
 
