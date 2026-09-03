@@ -118,10 +118,16 @@ def slab_trace(lon_2d, lat_2d, depth_2d, downsample=1, opacity=0.6):
             'Slab depth: %{surfacecolor:.0f} km<extra>Nazca Slab</extra>'
         ),
     )
-def slab_contour_trace(lon_2d, lat_2d, depth_2d, n_contours=15):
+def slab_contour_trace(lon_2d, lat_2d, depth_2d, n_contours=15, depth_range=None):
     """
     Depth contour lines of the slab drawn as Scatter3d at z=0 (surface projection).
     Extracts iso-depth contours from the 2D grid using matplotlib's contour engine.
+
+    depth_range: optional (min_km, max_km) — same depth-slider range used for the
+    tomography/earthquake filters. When given, grid points whose slab depth falls
+    outside the range are masked out (so contour lines don't extend past the
+    selected band) and the contour levels themselves are spaced across that
+    range instead of the slab's full depth extent.
     """
     import matplotlib
     matplotlib.use('Agg')
@@ -131,10 +137,19 @@ def slab_contour_trace(lon_2d, lat_2d, depth_2d, n_contours=15):
     la = lat_2d
     de = -np.array(depth_2d, dtype=np.float64)
 
+    if depth_range is not None:
+        depth_lo, depth_hi = float(depth_range[0]), float(depth_range[1])
+        out_of_range = (np.array(depth_2d, dtype=np.float64) < depth_lo) | \
+                        (np.array(depth_2d, dtype=np.float64) > depth_hi)
+        de = np.where(out_of_range, np.nan, de)
+
     valid = de[~np.isnan(de)]
     if len(valid) == 0:
         return None
-    levels = np.linspace(valid.min(), valid.max(), n_contours + 2)[1:-1]
+    if depth_range is not None:
+        levels = np.linspace(-depth_hi, -depth_lo, n_contours + 2)[1:-1]
+    else:
+        levels = np.linspace(valid.min(), valid.max(), n_contours + 2)[1:-1]
 
     fig_mpl, ax = plt.subplots()
     cs = ax.contour(lo, la, de, levels=levels)
@@ -454,6 +469,66 @@ def parse_earthquakes(raw_bytes):
     if has_mag:
         df['magnitude'] = pd.to_numeric(df['magnitude'], errors='coerce')
     return df, has_mag, None
+
+
+def parse_pha(raw_bytes):
+    """
+    Parse a NonLinLoc/HypoDD-style .pha phase file.
+
+    Event (hypocenter) header lines start with '#':
+        # YYYY MM DD HH MM SS.ss  LAT  LON  DEPTH  MAG  ERR_H ERR_V ERR_T  NPHASE
+    All other lines are per-station phase-pick lines and are ignored — only
+    the hypocenter location on each '#' line is extracted.
+
+    Returns (df, has_magnitude, error_str) with columns: lat, lon, depth,
+    magnitude, time (string 'YYYY-MM-DD HH:MM:SS.ss').
+    """
+    try:
+        text = raw_bytes.decode('utf-8', errors='replace')
+    except Exception:
+        return None, False, 'Cannot decode as UTF-8.'
+
+    rows = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith('#'):
+            continue
+        parts = line[1:].split()
+        if len(parts) < 9:
+            continue
+        try:
+            year, month, day, hour, minute = parts[0:5]
+            sec   = float(parts[5])
+            lat   = float(parts[6])
+            lon   = float(parts[7])
+            depth = float(parts[8])
+            mag   = float(parts[9]) if len(parts) > 9 else np.nan
+        except (ValueError, IndexError):
+            continue
+        rows.append({
+            'lat': lat, 'lon': lon, 'depth': depth, 'magnitude': mag,
+            'time': f'{year}-{int(month):02d}-{int(day):02d} '
+                    f'{int(hour):02d}:{int(minute):02d}:{sec:05.2f}',
+        })
+
+    if not rows:
+        return None, False, 'No event header lines (starting with "#") found.'
+
+    df = pd.DataFrame(rows)
+    has_mag = bool(df['magnitude'].notna().any())
+    return df, has_mag, None
+
+
+def parse_earthquake_file(raw_bytes, filename=''):
+    """
+    Dispatch earthquake-file parsing by extension:
+      .pha / .phs → hypocenter header lines (parse_pha)
+      everything else → CSV (parse_earthquakes)
+    """
+    ext = os.path.splitext(filename or '')[1].lower()
+    if ext in ('.pha', '.phs'):
+        return parse_pha(raw_bytes)
+    return parse_earthquakes(raw_bytes)
 
 
 def earthquake_trace(eq_df, scale_by_mag=False, cmin=None, cmax=None):
@@ -811,15 +886,25 @@ def build_figure(df, hq_min, iso_min, iso_max, n_surfaces, opacity,
         else:
             cs_mapped, do_reverse = cs, True   # non-seismic named scales keep original behaviour
 
-        traces.append(go.Isosurface(
+        # Volume rendering with a graded opacity ramp: values in the middle of
+        # the [isomin, isomax] window fade toward transparent, while the
+        # strongest anomalies at the extremes become opaque. This shows the
+        # whole field continuously instead of a handful of overlapping solid
+        # shells, which made weaker anomalies hard to pick out.
+        # surface_count controls how finely the volume is sampled — bump the
+        # floor up so the opacity ramp looks smooth even if the "surfaces"
+        # slider is set low (that control was tuned for discrete isosurfaces).
+        _vol_surface_count = max(int(n_surfaces), 15)
+
+        traces.append(go.Volume(
             x=x.tolist(), y=y.tolist(), z=z.tolist(),
             value=v.tolist(),
             isomin=iso_min_c, isomax=iso_max_c,
-            surface_count=n_surfaces,
+            surface_count=_vol_surface_count,
+            opacityscale='extremes',
             colorscale=cs_mapped, reversescale=do_reverse,
             cmin=cs_cmin, cmax=cs_cmax,
             showscale=True,
-            caps=dict(x_show=False, y_show=False, z_show=False),
             opacity=opacity,
             name=vel_label,
             colorbar=dict(
@@ -850,7 +935,7 @@ def build_figure(df, hq_min, iso_min, iso_max, n_surfaces, opacity,
         else:
             depth_clipped = depth_2d
         if slab_mode == 'contours':
-            tr = slab_contour_trace(lon_2d, lat_2d, depth_clipped)
+            tr = slab_contour_trace(lon_2d, lat_2d, depth_clipped, depth_range=depth_range)
             if tr is not None:
                 traces.append(tr)
         else:
@@ -874,7 +959,9 @@ def build_figure(df, hq_min, iso_min, iso_max, n_surfaces, opacity,
             traces.append(tr)
 
     # ── Country borders ───────────────────────────────────────────────────────
-    if show_borders:
+    # Borders are drawn at the surface (z≈0), so only show them when the
+    # selected depth window actually includes the surface (depth min == 0).
+    if show_borders and float(depth_range[0]) <= 0:
         tr = borders_trace(
             lat_min=_lat_min, lat_max=_lat_max,
             lon_min=_lon_min, lon_max=_lon_max,
@@ -884,13 +971,11 @@ def build_figure(df, hq_min, iso_min, iso_max, n_surfaces, opacity,
 
     # ── Earthquakes ───────────────────────────────────────────────────────────
     if show_earthquakes and eq_df is not None and len(eq_df) > 0:
-        # Match the slab's numeric depth range so colours are on the same scale
-        if slab_data is not None:
-            valid_slab = slab_data[2][~np.isnan(slab_data[2])]
-            eq_cmin = float(valid_slab.min()) if len(valid_slab) else None
-            eq_cmax = float(valid_slab.max()) if len(valid_slab) else None
-        else:
-            eq_cmin, eq_cmax = None, None
+        # Match the slab contours' colour range: same depth window as the
+        # depth-range slider, so earthquake markers and slab contour lines
+        # sit on the exact same Viridis colour scale.
+        eq_cmin = float(depth_range[0])
+        eq_cmax = float(depth_range[1])
         tr = earthquake_trace(eq_df, scale_by_mag=eq_scale_mag,
                               cmin=eq_cmin, cmax=eq_cmax)
         if tr is not None:
@@ -963,7 +1048,8 @@ def build_figure(df, hq_min, iso_min, iso_max, n_surfaces, opacity,
             xaxis={**ax, 'title': 'Longitude'},
             yaxis={**ax, 'title': 'Latitude'},
             zaxis={**ax, 'title': 'Depth',
-                       'tickvals': z_ticks, 'ticktext': z_labels},
+                       'tickvals': z_ticks, 'ticktext': z_labels,
+                       'range': [_z0, _z1]},
             bgcolor='rgb(8,8,18)',
             camera=dict(eye=dict(x=1.4, y=1.4, z=0.9)),
             aspectmode='manual',
@@ -1133,7 +1219,7 @@ except Exception as e:
 _EQ_PATH = 'eqs_NEIC_mag3.csv'
 try:
     with open(_EQ_PATH, 'rb') as _f:
-        _eq_df, _eq_has_mag, _eq_err = parse_earthquakes(_f.read())
+        _eq_df, _eq_has_mag, _eq_err = parse_earthquake_file(_f.read(), _EQ_PATH)
     if _eq_err:
         raise ValueError(_eq_err)
     _eq_msg = f'{_EQ_PATH}  ({len(_eq_df):,} events)'
@@ -1523,8 +1609,8 @@ window.addEventListener('beforeunload', function() {
                                         color='#7a90a8', letterSpacing='1px'),
                              children=f'data: {_vmin_g:.4f} → {_vmax_g:.4f}'),
 
-                    html.Span('SURFACE COUNT', style=SUB),
-                    dcc.Input(id='n-surfaces', type='number', value=5,
+                    html.Span('VOLUME SMOOTHNESS', style=SUB),
+                    dcc.Input(id='n-surfaces', type='number', value=15,
                               min=1, max=30, step=1, debounce=True,
                               style=dict(width='100%', boxSizing='border-box',
                                          background='rgb(10,10,22)',
@@ -1692,12 +1778,12 @@ window.addEventListener('beforeunload', function() {
 
                 # ── Earthquakes ───────────────────────────────────────────────
                 html.Div(style=PANEL, children=[
-                    html.Span('EARTHQUAKES  (.csv)', style=LBL),
+                    html.Span('EARTHQUAKES  (.csv / .pha)', style=LBL),
 
                     dcc.Upload(
                         id='upload-eq',
                         children=html.Div([
-                            html.Span('Drop CSV ', style=dict(color='#ffdd88')),
+                            html.Span('Drop CSV or PHA ', style=dict(color='#ffdd88')),
                             html.Span('(lat, lon, depth)', style=dict(color='#8fa8cc')),
                         ]),
                         style=dict(
@@ -1997,7 +2083,7 @@ def load_earthquakes(contents, filename):
     if not contents:
         raise dash.exceptions.PreventUpdate
     _, b64 = contents.split(',', 1)
-    eq_df, has_mag, err = parse_earthquakes(base64.b64decode(b64))
+    eq_df, has_mag, err = parse_earthquake_file(base64.b64decode(b64), filename)
     if err:
         return dash.no_update, _status_div(f'Error: {err}', ok=False), {'display': 'none'}
     mag_style = dict(marginTop='6px', display='block') if has_mag else {'display': 'none'}
